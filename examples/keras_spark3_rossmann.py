@@ -543,24 +543,17 @@ if CLUSTER:
 spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
 
-def predict_fn(model_bytes):
+def cpu_predict_fn(model_bytes):
     def fn(rows):
         import math
         import tensorflow as tf
         import tensorflow.keras.backend as K
         from pyspark import TaskContext
 
-        if PREDICT_ON_GPU:
-            config = tf.ConfigProto()
-            config.gpu_options.allow_growth = True
-            config.gpu_options.visible_device_list = TaskContext.get().resources()['gpu'].addresses[0]
-            K.set_session(tf.Session(config=config))
-        else:
-            config = tf.ConfigProto(device_count={'GPU': 0})
-            config.inter_op_parallelism_threads = 1
-            config.intra_op_parallelism_threads = 1
-            K.set_session(tf.Session(config=config))
-
+        config = tf.ConfigProto(device_count={'GPU': 0})
+        config.inter_op_parallelism_threads = 1
+        config.intra_op_parallelism_threads = 1
+        K.set_session(tf.Session(config=config))
 
         # Restore from checkpoint.
         model = deserialize_model(model_bytes, tf.keras.models.load_model)
@@ -576,7 +569,31 @@ def predict_fn(model_bytes):
 
     return fn
 
+def gpu_predict_fn(model_bytes):
+    def fn(rows):
+        import math
+        import tensorflow as tf
+        import tensorflow.keras.backend as K
+        from pyspark import TaskContext
 
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        config.gpu_options.visible_device_list = TaskContext.get().resources()['gpu'].addresses[0]
+        K.set_session(tf.Session(config=config))
+
+        # Restore from checkpoint.
+        model = deserialize_model(model_bytes, tf.keras.models.load_model)
+
+        # Perform predictions.
+        dataset = [row.asDict() for row in rows]
+        to_predict = [[row[col] for col in all_cols] for row in dataset]
+        log_saleses = model.predict(to_predict, steps=math.ceil(len(to_predict)/32))
+        results = [Row(**row, Sales=math.exp(log_sales[0])) for row, log_sales in zip(dataset, log_saleses)]
+        return results
+
+    return fn
+
+predict_fn = gpu_predict_fn if PREDICT_ON_GPU else cpu_predict_fn
 pred_df = spark.read.parquet('%s/test_df.parquet' % DATA_LOCATION) \
     .rdd.mapPartitions(predict_fn(best_model_bytes)).toDF()
 submission_df = pred_df.select(pred_df.Id.cast(T.IntegerType()), pred_df.Sales).toPandas()
