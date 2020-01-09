@@ -30,7 +30,7 @@ DATA_LOCATION = 'file://' + os.getcwd()
 # Location of outputs on local filesystem (without file:// prefix).
 LOCAL_SUBMISSION_CSV = 'submission.csv'
 LOCAL_CHECKPOINT_FILE = 'checkpoint.h5'
-DISCOVERY_SCRIPT = 'get_gpu_resources.sh'
+DISCOVERY_SCRIPT = '/shared/tools/get_gpu_resources.sh'
 
 # Spark clusters to use for training. If set to None, uses current default cluster.
 #
@@ -39,11 +39,12 @@ DISCOVERY_SCRIPT = 'get_gpu_resources.sh'
 #
 # Training cluster should be set up to provide a Spark task per multiple CPU cores,
 # or per GPU, e.g. by supplying `-c <NUM GPUs>` in Spark Standalone mode.
-LIGHT_PROCESSING_CLUSTER = None  # or 'spark://hostname:7077'
-TRAINING_CLUSTER = 'local-cluster[2,1,1024]'  # or 'spark://hostname:7077'
+CLUSTER = None
 
 # The number of training processes.
 NUM_TRAINING_PROC = 4
+
+PREDICT_ON_GPU = True
 
 # Desired sampling rate.  Useful to set to low number (e.g. 0.01) to make sure
 # that end-to-end process works.
@@ -66,8 +67,8 @@ print('================')
 
 # Create Spark session for data preparation.
 conf = SparkConf().setAppName('data_prep').set('spark.sql.shuffle.partitions', '16')
-if LIGHT_PROCESSING_CLUSTER:
-    conf.setMaster(LIGHT_PROCESSING_CLUSTER)
+if CLUSTER:
+    conf.setMaster(CLUSTER)
 spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
 train_csv = spark.read.csv('%s/train.csv' % DATA_LOCATION, header=True)
@@ -150,7 +151,8 @@ def prepare_df(df):
 
     # Merge in Google Trend for whole Germany.
     google_trend_de = google_trend_all[google_trend_all.file == 'Rossmann_DE']
-    df = df.join(google_trend_de, ['Year', 'Week']).select(df['*'], google_trend_all.trend.alias('trend_de'))
+    google_trend_de = google_trend_de.select('Year', 'Week', google_trend_de.trend.alias('trend_de'))
+    df = df.join(google_trend_de, ['Year', 'Week'])
 
     # Merge in weather.
     weather = weather_csv.join(state_names_csv, weather_csv.file == state_names_csv.StateName)
@@ -175,7 +177,7 @@ def prepare_df(df):
 
     # Days & weeks of promotion, cap to 25 weeks.
     df = df.withColumn('Promo2Since',
-                       F.expr('date_add(format_string("%s-01-01", Promo2SinceYear), (Promo2SinceWeek - 1) * 7)'))
+                       F.expr('date_add(format_string("%s-01-01", Promo2SinceYear), (cast(Promo2SinceWeek as int) - 1) * 7)'))
     df = df.withColumn('Promo2Days',
                        F.when(df.Promo2SinceYear > 1900,
                               F.greatest(F.lit(0), F.least(F.lit(25 * 7), F.datediff(df.Date, df.Promo2Since))))
@@ -490,13 +492,14 @@ def train_fn(model_bytes):
 
 # Create Spark session for training.
 conf = SparkConf().setAppName('training')
-if TRAINING_CLUSTER:
-    conf.setMaster(TRAINING_CLUSTER)
+if CLUSTER:
+    conf.setMaster(CLUSTER)
 conf = conf.set("spark.test.home", os.environ.get('SPARK_HOME'))
 conf = conf.set("spark.worker.resource.gpu.discoveryScript", DISCOVERY_SCRIPT)
 conf = conf.set("spark.worker.resource.gpu.amount", 1)
-conf = conf.set("spark.task.resource.gpu.amount", "1")
+conf = conf.set("spark.executor.resource.gpu.discoveryScript", DISCOVERY_SCRIPT)
 conf = conf.set("spark.executor.resource.gpu.amount", "1")
+conf = conf.set("spark.task.resource.gpu.amount", "1")
 
 spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
@@ -526,8 +529,17 @@ print('================')
 conf = SparkConf().setAppName('prediction') \
     .setExecutorEnv('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH')) \
     .setExecutorEnv('PATH', os.environ.get('PATH'))
-if LIGHT_PROCESSING_CLUSTER:
-    conf.setMaster(LIGHT_PROCESSING_CLUSTER)
+
+if PREDICT_ON_GPU:
+    conf = conf.set("spark.test.home", os.environ.get('SPARK_HOME'))
+    conf = conf.set("spark.worker.resource.gpu.discoveryScript", DISCOVERY_SCRIPT)
+    conf = conf.set("spark.worker.resource.gpu.amount", 1)
+    conf = conf.set("spark.executor.resource.gpu.discoveryScript", DISCOVERY_SCRIPT)
+    conf = conf.set("spark.executor.resource.gpu.amount", "1")
+    conf = conf.set("spark.task.resource.gpu.amount", "1")
+
+if CLUSTER:
+    conf.setMaster(CLUSTER)
 spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
 
@@ -536,12 +548,19 @@ def predict_fn(model_bytes):
         import math
         import tensorflow as tf
         import tensorflow.keras.backend as K
+        from pyspark import TaskContext
 
-        # Do not use GPUs for prediction, use single CPU core per task.
-        config = tf.ConfigProto(device_count={'GPU': 0})
-        config.inter_op_parallelism_threads = 1
-        config.intra_op_parallelism_threads = 1
-        K.set_session(tf.Session(config=config))
+        if PREDICT_ON_GPU:
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            config.gpu_options.visible_device_list = TaskContext.get().resources()['gpu'].addresses[0]
+            K.set_session(tf.Session(config=config))
+        else:
+            config = tf.ConfigProto(device_count={'GPU': 0})
+            config.inter_op_parallelism_threads = 1
+            config.intra_op_parallelism_threads = 1
+            K.set_session(tf.Session(config=config))
+
 
         # Restore from checkpoint.
         model = deserialize_model(model_bytes, tf.keras.models.load_model)
