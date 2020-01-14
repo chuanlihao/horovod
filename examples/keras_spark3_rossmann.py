@@ -30,7 +30,7 @@ DATA_LOCATION = 'file://' + os.getcwd()
 # Location of outputs on local filesystem (without file:// prefix).
 LOCAL_SUBMISSION_CSV = 'submission.csv'
 LOCAL_CHECKPOINT_FILE = 'checkpoint.h5'
-DISCOVERY_SCRIPT = 'get_gpu_resources.sh'
+DISCOVERY_SCRIPT = '/shared/tools/get_gpu_resources.sh'
 
 # Spark clusters to use for training. If set to None, uses current default cluster.
 #
@@ -40,10 +40,10 @@ DISCOVERY_SCRIPT = 'get_gpu_resources.sh'
 # Training cluster should be set up to provide a Spark task per multiple CPU cores,
 # or per GPU, e.g. by supplying `-c <NUM GPUs>` in Spark Standalone mode.
 LIGHT_PROCESSING_CLUSTER = None  # or 'spark://hostname:7077'
-TRAINING_CLUSTER = 'local-cluster[2,1,1024]'  # or 'spark://hostname:7077'
+TRAINING_CLUSTER = None
 
 # The number of training processes.
-NUM_TRAINING_PROC = 4
+NUM_TRAINING_PROC = 1
 
 # Desired sampling rate.  Useful to set to low number (e.g. 0.01) to make sure
 # that end-to-end process works.
@@ -57,10 +57,10 @@ LR = 1e-4
 PETASTORM_HDFS_DRIVER = 'libhdfs'
 
 # Whether to infer on GPU.
-GPU_INFERENCE_ENABLED = False
+GPU_INFERENCE_ENABLED = True
 
 # Cluster for GPU inference.
-GPU_INFERENCE_CLUSTER = 'local-cluster[2,1,1024]'  # or 'spark://hostname:7077'
+GPU_INFERENCE_CLUSTER = None
 
 # ================ #
 # DATA PREPARATION #
@@ -156,7 +156,8 @@ def prepare_df(df):
 
     # Merge in Google Trend for whole Germany.
     google_trend_de = google_trend_all[google_trend_all.file == 'Rossmann_DE']
-    df = df.join(google_trend_de, ['Year', 'Week']).select(df['*'], google_trend_all.trend.alias('trend_de'))
+    google_trend_de = google_trend_de.select('Year', 'Week', google_trend_de.trend.alias('trend_de'))
+    df = df.join(google_trend_de, ['Year', 'Week'])
 
     # Merge in weather.
     weather = weather_csv.join(state_names_csv, weather_csv.file == state_names_csv.StateName)
@@ -181,7 +182,7 @@ def prepare_df(df):
 
     # Days & weeks of promotion, cap to 25 weeks.
     df = df.withColumn('Promo2Since',
-                       F.expr('date_add(format_string("%s-01-01", Promo2SinceYear), (Promo2SinceWeek - 1) * 7)'))
+                       F.expr('date_add(format_string("%s-01-01", Promo2SinceYear), (cast(Promo2SinceWeek as int) - 1) * 7)'))
     df = df.withColumn('Promo2Days',
                        F.when(df.Promo2SinceYear > 1900,
                               F.greatest(F.lit(0), F.least(F.lit(25 * 7), F.datediff(df.Date, df.Promo2Since))))
@@ -482,7 +483,7 @@ def train_fn(model_bytes):
                                 validation_steps=int(val_rows / BATCH_SIZE / hvd.size()),
                                 callbacks=callbacks,
                                 verbose=verbose,
-                                epochs=100)
+                                epochs=2)
 
     # Dataset API usage currently displays a wall of errors upon termination.
     # This global model registration ensures clean termination.
